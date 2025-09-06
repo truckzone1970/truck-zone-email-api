@@ -1,0 +1,13 @@
+{
+  "name": "truck-zone-email-api",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "nodemailer": "^6.9.13",
+    "zod": "^3.23.8"
+  },
+  "scripts": {
+    "vercel-build": "echo no-build"
+  }
+}
