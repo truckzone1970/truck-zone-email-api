@@ -1,9 +1,10 @@
 // api/contact.js
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import nodemailer from "nodemailer";
 import { z, ZodError } from "zod";
-import { renderCustomerAutoReply, renderInternalLead } from "./templates.js";
+import { renderCustomerAutoReply, renderInternalLead } from "./templates.js"; // <- ensure filename matches
 
 /** CORS: allow one or more origins via env (comma-separated) */
 function setCors(req, res) {
@@ -35,59 +36,101 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
 
+  // ✅ In local serverless, req.body can arrive as a string
+  if (req.headers["content-type"]?.includes("application/json") && typeof req.body === "string") {
+    try { req.body = JSON.parse(req.body); }
+    catch { return res.status(400).json({ ok:false, error:"Invalid JSON" }); }
+  }
+
   try {
     const data = contactSchema.parse(req.body || {});
 
-    const brandName = process.env.BRAND_NAME || "Truck Zone";
-    const brandUrl  = process.env.BRAND_URL  || "https://truck-zone.ca";
-
-    // SMTP (Namecheap Private Email)
+    // --- SMTP setup ---
+    const useSecure = String(process.env.SMTP_SECURE ?? "true") === "true";
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST || "mail.privateemail.com",
-      port: Number(process.env.SMTP_PORT || 465),
-      secure: String(process.env.SMTP_SECURE ?? "true") === "true", // 465=true, 587=false
+      port: Number(process.env.SMTP_PORT || (useSecure ? 465 : 587)),
+      secure: useSecure, // 465=true, 587=false
       auth: {
-        user: process.env.SMTP_USER, // required
-        pass: process.env.SMTP_PASS  // required
-      }
-      // If you ever hit cert issues, you can add: tls: { rejectUnauthorized: false }
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
     });
 
-    // Optional CID logo attachment
-    const logoCid  = process.env.LOGO_CID || "truckzone-logo";
-    const logoPath = path.join(process.cwd(), "api", "assets", "logo-email.png");
-    const attachments = fs.existsSync(logoPath)
-      ? [{ filename: "logo-email.png", path: logoPath, cid: logoCid }]
-      : [];
+    // Fail early with a clear message if SMTP is not configured/working
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      return res.status(500).json({ ok:false, error:"SMTP not configured" });
+    }
+    try {
+      await transporter.verify();
+    } catch (e) {
+      console.error("SMTP verify failed:", e?.message || e);
+      return res.status(500).json({ ok:false, error:"SMTP verification failed" });
+    }
 
+    // --- Attachment path & CID ---
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    const logoPath  = path.join(__dirname, "assets", "logo-email.png");
+    const logoCid   = process.env.LOGO_CID || "truckzone-logo";
+
+    let attachments = [];
+    try {
+      if (fs.existsSync(logoPath)) {
+        attachments = [{
+          filename: "logo-email.png",
+          path: logoPath,
+          cid: logoCid,
+          contentDisposition: "inline",
+          contentType: "image/png",
+        }];
+      } else {
+        console.warn("Logo not found at:", logoPath);
+      }
+    } catch (e) {
+      console.warn("Logo attachment check failed:", e?.message || e);
+      attachments = []; // don't crash the function
+    }
+
+    const brandName = process.env.BRAND_NAME || "Truck Zone";
+    const brandUrl  = process.env.BRAND_URL  || "https://truck-zone.ca";
     const fromEmail = process.env.FROM_EMAIL || process.env.SMTP_USER;
     const inboxTo   = process.env.TO_EMAIL   || process.env.SMTP_USER;
 
     // 1) Internal notification
-    await transporter.sendMail({
-      from: `"${brandName} Website" <${fromEmail}>`,
-      to: inboxTo,
-      subject: `New inquiry: ${data.subject} — ${data.firstName} ${data.lastName}`,
-      replyTo: data.email,
-      html: renderInternalLead({ ...data, brandName, brandUrl, logoCid }),
-      attachments
-    });
+    try {
+      await transporter.sendMail({
+        from: `"${brandName} Website" <${fromEmail}>`,
+        to: inboxTo,
+        subject: `New inquiry: ${data.subject} — ${data.firstName} ${data.lastName}`,
+        replyTo: data.email,
+        html: renderInternalLead({ ...data, brandName, brandUrl, logoCid }),
+        attachments,
+      });
+    } catch (e) {
+      console.error("Internal notification send failed:", e?.message || e);
+      return res.status(500).json({ ok:false, error:"Failed to send internal email" });
+    }
 
     // 2) Auto-reply to customer
-    await transporter.sendMail({
-      from: `"${brandName} Support" <${fromEmail}>`,
-      to: data.email,
-      subject: `Thanks, ${data.firstName}! We received your request ✅`,
-      html: renderCustomerAutoReply({ ...data, brandName, brandUrl, logoCid }),
-      attachments
-    });
+    try {
+      await transporter.sendMail({
+        from: `"${brandName} Support" <${fromEmail}>`,
+        to: data.email,
+        subject: `Thanks, ${data.firstName}! We received your request ✅`,
+        html: renderCustomerAutoReply({ ...data, brandName, brandUrl, logoCid }),
+        attachments,
+      });
+    } catch (e) {
+      console.error("Customer auto-reply send failed:", e?.message || e);
+      return res.status(500).json({ ok:false, error:"Failed to send auto-reply" });
+    }
 
     return res.status(200).json({ ok: true });
   } catch (err) {
     if (err instanceof ZodError) {
       return res.status(400).json({ ok:false, error: err.issues?.[0]?.message || "Validation error" });
     }
-    console.error("contact handler error:", err);
+    console.error("contact handler error:", err?.message || err);
     return res.status(500).json({ ok:false, error:"Internal Server Error" });
   }
 }
