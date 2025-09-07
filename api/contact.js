@@ -4,17 +4,17 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import nodemailer from "nodemailer";
 import { z, ZodError } from "zod";
-import { renderCustomerAutoReply, renderInternalLead } from "./templates.js"; // <- ensure filename matches
+import { renderCustomerAutoReply, renderInternalLead } from "./templates.js";
 
 /** CORS: allow one or more origins via env (comma-separated) */
-function setCors(req, res) {
-  const list = (process.env.CORS_ORIGIN || "https://truck-zone.ca")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
+const ALLOW_LIST = (process.env.CORS_ORIGIN || "https://truck-zone.ca")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
+function setCors(req, res) {
   const origin = req.headers.origin;
-  if (origin && list.includes(origin)) {
+  if (origin && ALLOW_LIST.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
@@ -36,7 +36,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
 
-  // ✅ In local serverless, req.body can arrive as a string
+  // Some runtimes pass body as a string; normalize to object.
   if (req.headers["content-type"]?.includes("application/json") && typeof req.body === "string") {
     try { req.body = JSON.parse(req.body); }
     catch { return res.status(400).json({ ok:false, error:"Invalid JSON" }); }
@@ -46,50 +46,38 @@ export default async function handler(req, res) {
     const data = contactSchema.parse(req.body || {});
 
     // --- SMTP setup ---
-    const useSecure = String(process.env.SMTP_SECURE ?? "true") === "true";
+    const secure = String(process.env.SMTP_SECURE ?? "true") === "true";
     const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || "mail.privateemail.com",
-      port: Number(process.env.SMTP_PORT || (useSecure ? 465 : 587)),
-      secure: useSecure, // 465=true, 587=false
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      },
+      host: process.env.SMTP_HOST,                        // e.g. server71.web-hosting.com
+      port: Number(process.env.SMTP_PORT || (secure ? 465 : 587)),
+      secure,                                             // 465=true, 587=false
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      tls: { servername: process.env.SMTP_HOST },         // ✅ SNI for shared hosts
     });
 
-    // Fail early with a clear message if SMTP is not configured/working
     if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
       return res.status(500).json({ ok:false, error:"SMTP not configured" });
     }
-    try {
-      await transporter.verify();
-    } catch (e) {
+
+    // Leave on while debugging; you can remove later.
+    await transporter.verify().catch(e => {
       console.error("SMTP verify failed:", e?.message || e);
-      return res.status(500).json({ ok:false, error:"SMTP verification failed" });
-    }
+      throw new Error("SMTP verification failed");
+    });
 
     // --- Attachment path & CID ---
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const logoPath  = path.join(__dirname, "assets", "logo-email.png");
     const logoCid   = process.env.LOGO_CID || "truckzone-logo";
-
-    let attachments = [];
-    try {
-      if (fs.existsSync(logoPath)) {
-        attachments = [{
+    const attachments = fs.existsSync(logoPath)
+      ? [{
           filename: "logo-email.png",
           path: logoPath,
           cid: logoCid,
           contentDisposition: "inline",
           contentType: "image/png",
-        }];
-      } else {
-        console.warn("Logo not found at:", logoPath);
-      }
-    } catch (e) {
-      console.warn("Logo attachment check failed:", e?.message || e);
-      attachments = []; // don't crash the function
-    }
+        }]
+      : [];
 
     const brandName = process.env.BRAND_NAME || "Truck Zone";
     const brandUrl  = process.env.BRAND_URL  || "https://truck-zone.ca";
@@ -97,33 +85,23 @@ export default async function handler(req, res) {
     const inboxTo   = process.env.TO_EMAIL   || process.env.SMTP_USER;
 
     // 1) Internal notification
-    try {
-      await transporter.sendMail({
-        from: `"${brandName} Website" <${fromEmail}>`,
-        to: inboxTo,
-        subject: `New inquiry: ${data.subject} — ${data.firstName} ${data.lastName}`,
-        replyTo: data.email,
-        html: renderInternalLead({ ...data, brandName, brandUrl, logoCid }),
-        attachments,
-      });
-    } catch (e) {
-      console.error("Internal notification send failed:", e?.message || e);
-      return res.status(500).json({ ok:false, error:"Failed to send internal email" });
-    }
+    await transporter.sendMail({
+      from: `"${brandName} Website" <${fromEmail}>`,
+      to: inboxTo,
+      subject: `New inquiry: ${data.subject} — ${data.firstName} ${data.lastName}`,
+      replyTo: data.email,
+      html: renderInternalLead({ ...data, brandName, brandUrl, logoCid }),
+      attachments,
+    });
 
     // 2) Auto-reply to customer
-    try {
-      await transporter.sendMail({
-        from: `"${brandName} Support" <${fromEmail}>`,
-        to: data.email,
-        subject: `Thanks, ${data.firstName}! We received your request ✅`,
-        html: renderCustomerAutoReply({ ...data, brandName, brandUrl, logoCid }),
-        attachments,
-      });
-    } catch (e) {
-      console.error("Customer auto-reply send failed:", e?.message || e);
-      return res.status(500).json({ ok:false, error:"Failed to send auto-reply" });
-    }
+    await transporter.sendMail({
+      from: `"${brandName} Support" <${fromEmail}>`,
+      to: data.email,
+      subject: `Thanks, ${data.firstName}! We received your request ✅`,
+      html: renderCustomerAutoReply({ ...data, brandName, brandUrl, logoCid }),
+      attachments,
+    });
 
     return res.status(200).json({ ok: true });
   } catch (err) {
